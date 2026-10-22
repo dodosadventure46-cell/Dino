@@ -178,12 +178,28 @@ jobs:
           set -o pipefail
           "$GODOT_BIN" --headless --path "$PROJECT_DIR" --check-only --script res://scripts/main.gd 2>&1 | tee "$GITHUB_WORKSPACE/build/script-check.log"
 
+      - name: Diagnostik lingkungan Android
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "== Java =="; echo "JAVA_HOME=$JAVA_HOME"; "$JAVA_HOME/bin/javac" -version 2>&1 || true
+          echo "== Android SDK =="; echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platform-tools/adb" || true
+          echo "build-tools:"; ls "$ANDROID_HOME/build-tools" || true
+          echo "cmdline-tools:"; ls "$ANDROID_HOME/cmdline-tools" || true
+          echo "platforms:"; ls "$ANDROID_HOME/platforms" || true
+          echo "== Export template Android =="
+          ls -la "$HOME/.local/share/godot/export_templates/$GODOT_VERSION.stable" | grep -i android || echo "TEMPLATE ANDROID TIDAK ADA"
+          echo "== Keystore =="; ls -la "$HOME/.android/debug.keystore" || true
+          echo "== Setting ETC2/ASTC =="; grep -n "etc2" "$PROJECT_DIR/project.godot" || echo "ETC2/ASTC BELUM DIAKTIFKAN"
+          echo "== export_presets.cfg =="; grep -nE "^(name|platform|export_path)=" "$PROJECT_DIR/export_presets.cfg"
+
       - name: Export debug APK
         shell: bash
         run: |
           set -o pipefail
           "$GODOT_BIN" --headless --path "$PROJECT_DIR" \
-            --export-debug "$PRESET_NAME" "$GITHUB_WORKSPACE/build/$APK_NAME" 2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
+            --verbose --export-debug "$PRESET_NAME" "$GITHUB_WORKSPACE/build/$APK_NAME" 2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
           ls -la "$GITHUB_WORKSPACE/build"
           test -s "$GITHUB_WORKSPACE/build/$APK_NAME"
 
