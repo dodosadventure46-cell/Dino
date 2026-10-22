@@ -1,0 +1,109 @@
+name: Build Zoo Tycoon Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and extract the uploaded project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="Zoo_Tycoon_Godot_GitHub.zip"
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: $ZIP_FILE was not found in the repository root. Upload the project ZIP without renaming it."
+            exit 1
+          fi
+          mkdir -p extracted_project
+          unzip -q "$ZIP_FILE" -d extracted_project
+          PROJECT_FILE="$(find extracted_project -type f -name project.godot -print -quit)"
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "ERROR: No project.godot was found inside the ZIP."
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Godot project found at: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Download Godot 4.4.1 and export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          GODOT_VERSION="4.4.1"
+          mkdir -p "$HOME/godot/bin" "$HOME/godot/templates" "$HOME/.local/share/godot/export_templates/$GODOT_VERSION.stable"
+          curl -L --fail --retry 3 "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -o "$HOME/godot/godot.zip"
+          unzip -q "$HOME/godot/godot.zip" -d "$HOME/godot/bin"
+          GODOT_BIN="$(find "$HOME/godot/bin" -type f -name 'Godot_v*' -print -quit)"
+          if [ -z "$GODOT_BIN" ]; then echo "ERROR: Godot executable was not found."; exit 1; fi
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+          curl -L --fail --retry 3 "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -o "$HOME/godot/templates.tpz"
+          unzip -q "$HOME/godot/templates.tpz" -d "$HOME/godot/templates"
+          TEMPLATE_DIR="$(find "$HOME/godot/templates" -type d -name templates -print -quit)"
+          if [ -z "$TEMPLATE_DIR" ]; then
+            TEMPLATE_DIR="$(find "$HOME/godot/templates" -type f -name 'android_debug.apk' -printf '%h\n' | head -n 1)"
+          fi
+          if [ -z "$TEMPLATE_DIR" ]; then echo "ERROR: Godot export templates could not be located."; find "$HOME/godot/templates" -maxdepth 3 -type f | head -50; exit 1; fi
+          cp -a "$TEMPLATE_DIR"/. "$HOME/.local/share/godot/export_templates/$GODOT_VERSION.stable/"
+
+      - name: Prepare Android debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" -noprompt
+          PRESET="$PROJECT_DIR/export_presets.cfg"
+          if [ ! -f "$PRESET" ]; then echo "ERROR: export_presets.cfg is missing from the project."; exit 1; fi
+          sed -i "s|keystore/debug=\"\"|keystore/debug=\"$HOME/.android/debug.keystore\"|" "$PRESET"
+
+      - name: Import project resources
+        run: "$GODOT_BIN" --headless --editor --path "$PROJECT_DIR" --import
+
+      - name: Validate project
+        run: "$GODOT_BIN" --headless --path "$PROJECT_DIR" --editor --quit
+
+      - name: Export debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROJECT_DIR/build"
+          "$GODOT_BIN" --headless --path "$PROJECT_DIR" --export-debug "Android" "$PROJECT_DIR/build/ZooTycoon.apk"
+          test -s "$PROJECT_DIR/build/ZooTycoon.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZooTycoon-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/ZooTycoon.apk
+          if-no-files-found: error
+          retention-days: 14
