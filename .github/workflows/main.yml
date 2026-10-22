@@ -1,0 +1,270 @@
+
+name: Build Zoo Tycoon Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Locate Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "::error::Android SDK tidak ditemukan."
+            exit 1
+          fi
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
+            -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan di Android SDK."
+            exit 1
+          fi
+
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Download Godot 4.4.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          wget -q \
+            "https://github.com/godotengine/godot/releases/download/4.4.1-stable/Godot_v4.4.1-stable_linux.x86_64.zip" \
+            -O /tmp/godot.zip
+
+          unzip -oq /tmp/godot.zip -d /tmp/godot
+
+          GODOT_BIN="$(find /tmp/godot -maxdepth 1 \
+            -type f -name 'Godot*' | head -n 1)"
+
+          if [ -z "$GODOT_BIN" ]; then
+            echo "::error::Executable Godot tidak ditemukan."
+            exit 1
+          fi
+
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+
+      - name: Install Godot export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          wget -q \
+            "https://github.com/godotengine/godot/releases/download/4.4.1-stable/Godot_v4.4.1-stable_export_templates.tpz" \
+            -O /tmp/templates.tpz
+
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.4.1.stable"
+          mkdir -p "$TEMPLATE_DIR"
+          mkdir -p /tmp/godot-templates
+
+          unzip -oq /tmp/templates.tpz -d /tmp/godot-templates
+
+          TEMPLATE="$(find /tmp/godot-templates \
+            -name android_debug.apk -type f | head -n 1)"
+
+          if [ -z "$TEMPLATE" ]; then
+            echo "::error::Template Android Godot tidak ditemukan."
+            exit 1
+          fi
+
+          cp -a "$(dirname "$TEMPLATE")/." "$TEMPLATE_DIR/"
+
+      - name: Extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find . -maxdepth 1 -type f \
+            -iname '*.zip' | head -n 1 || true)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Upload ZIP proyek ke root repository."
+            exit 1
+          fi
+
+          mkdir -p project
+          unzip -oq "$ZIP_FILE" -d project
+
+          PROJECT_FILE="$(find project -name project.godot \
+            -type f | head -n 1 || true)"
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "::error::project.godot tidak ditemukan di ZIP."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$(dirname "$PROJECT_FILE")" >> "$GITHUB_ENV"
+
+      - name: Import Godot resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          "$GODOT_BIN" --headless --editor \
+            --path "$PROJECT_DIR" --import
+
+      - name: Verify Android export preset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRESET="$PROJECT_DIR/export_presets.cfg"
+
+          if [ ! -f "$PRESET" ]; then
+            echo "::error::export_presets.cfg tidak ditemukan."
+            exit 1
+          fi
+
+          if ! grep -Eq '^[[:space:]]*name="Android"' "$PRESET"; then
+            echo "::error::Preset Android tidak ditemukan."
+            exit 1
+          fi
+
+      - name: Configure Android debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYSTORE="$RUNNER_TEMP/debug.keystore"
+
+          keytool -genkeypair \
+            -keystore "$KEYSTORE" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -noprompt
+
+          echo "ANDROID_DEBUG_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+
+      - name: Configure export preset keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "$PROJECT_DIR/export_presets.cfg" \
+            "$ANDROID_DEBUG_KEYSTORE" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          keystore = sys.argv[2]
+          text = path.read_text(encoding="utf-8")
+
+          header = re.search(
+              r'(?m)^\[preset\.(\d+)\]\s*\n(?:(?!^\[).*\n)*?'
+              r'(?m)^name="Android"\s*$',
+              text
+          )
+
+          if not header:
+              raise SystemExit(
+                  "Preset Android tidak ditemukan dalam export_presets.cfg."
+              )
+
+          index = header.group(1)
+          options_header = f"[preset.{index}.options]"
+
+          if options_header not in text:
+              raise SystemExit(
+                  f"Bagian {options_header} tidak ditemukan."
+              )
+
+          start = text.index(options_header) + len(options_header)
+          next_section = re.search(r'(?m)^\[preset\.', text[start:])
+          end = start + next_section.start() if next_section else len(text)
+          section = text[start:end]
+
+          settings = {
+              "keystore/debug": keystore,
+              "keystore/debug_user": "androiddebugkey",
+              "keystore/debug_password": "android",
+          }
+
+          for key, value in settings.items():
+              line = f'{key} = "{value}"'
+              pattern = re.compile(
+                  r'(?m)^' + re.escape(key) + r'\s*=.*$'
+              )
+
+              if pattern.search(section):
+                  section = pattern.sub(lambda _: line, section)
+              else:
+                  section += "\n" + line
+
+          text = text[:start] + section + text[end:]
+          path.write_text(text, encoding="utf-8")
+          print(f"Konfigurasi keystore preset {index} selesai.")
+          PY
+
+      - name: Export APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$PROJECT_DIR/build"
+
+          "$GODOT_BIN" --headless \
+            --path "$PROJECT_DIR" \
+            --export-debug "Android" \
+            "$PROJECT_DIR/build/ZooTycoon.apk"
+
+          if [ ! -s "$PROJECT_DIR/build/ZooTycoon.apk" ]; then
+            echo "::error::APK tidak berhasil dibuat."
+            exit 1
+          fi
+
+          echo "APK berhasil dibuat:"
+          ls -lh "$PROJECT_DIR/build/ZooTycoon.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZooTycoon-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/ZooTycoon.apk
+          if-no-files-found: error
+          retention-days: 14
