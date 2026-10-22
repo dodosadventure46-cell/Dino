@@ -1,0 +1,185 @@
+name: Build Zoo Tycoon APK
+
+# Taruh file ini di repo pada path: .github/workflows/build-apk.yml
+# Upload juga Zoo_Tycoon_Godot_GitHub.zip ke root repo (TIDAK perlu diekstrak).
+# Kalau proyek sudah diekstrak (project.godot di root repo), workflow ini tetap jalan.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: "4.4.1"
+  PRESET_NAME: "Android"
+  APK_NAME: "ZooTycoon.apk"
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Siapkan proyek (ekstrak ZIP di runner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_FILE=""
+
+          if [ -f "project.godot" ]; then
+            echo "project.godot ada di root repo"
+            PROJECT_FILE="$GITHUB_WORKSPACE/project.godot"
+          else
+            ZIP=""
+            while IFS= read -r z; do
+              if unzip -l "$z" | grep -q 'project\.godot'; then ZIP="$z"; break; fi
+            done < <(find . -maxdepth 2 -type f -name '*.zip' -not -path './.git/*')
+            if [ -n "$ZIP" ]; then
+              echo "ZIP ditemukan: $ZIP"
+              mkdir -p "$GITHUB_WORKSPACE/_game"
+              unzip -q "$ZIP" -d "$GITHUB_WORKSPACE/_game"
+              PROJECT_FILE="$(find "$GITHUB_WORKSPACE/_game" -type f -name project.godot | head -n 1)"
+            else
+              PROJECT_FILE="$(find . -maxdepth 3 -type f -name project.godot -not -path './.git/*' | head -n 1)"
+              [ -n "$PROJECT_FILE" ] && PROJECT_FILE="$GITHUB_WORKSPACE/${PROJECT_FILE#./}"
+            fi
+          fi
+
+          if [ -z "$PROJECT_FILE" ] || [ ! -f "$PROJECT_FILE" ]; then
+            echo "::error::Tidak menemukan project.godot (upload ZIP proyek ke root repo)"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Folder proyek: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+          test -f "$PROJECT_DIR/export_presets.cfg" || { echo "::error::export_presets.cfg tidak ada"; exit 1; }
+
+      - name: Cek tipe file gambar
+        shell: bash
+        run: |
+          # Pastikan file .png benar-benar PNG (bukan JPEG yang diganti nama)
+          bad=0
+          while IFS= read -r f; do
+            if ! head -c 8 "$f" | od -An -tx1 | tr -d ' \n' | grep -q '^89504e470d0a1a0a'; then
+              echo "::error::$f bukan PNG asli (kemungkinan JPEG berekstensi .png)"
+              bad=1
+            fi
+          done < <(find "$PROJECT_DIR" -type f -iname '*.png')
+          exit $bad
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install komponen Android SDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install \
+            "cmdline-tools;latest" \
+            "platform-tools" \
+            "platforms;android-34" "platforms;android-35" \
+            "build-tools;34.0.0" "build-tools;35.0.1" \
+            "cmake;3.10.2.4988404" || true
+
+      - name: Download Godot dan export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$GODOT_VERSION"
+          BASE="https://github.com/godotengine/godot/releases/download/${V}-stable"
+          mkdir -p "$HOME/godot" "$HOME/.local/share/godot/export_templates/${V}.stable"
+
+          curl -L --fail --retry 3 "$BASE/Godot_v${V}-stable_linux.x86_64.zip" -o "$HOME/godot/godot.zip"
+          unzip -q "$HOME/godot/godot.zip" -d "$HOME/godot/bin"
+          GODOT_BIN="$(find "$HOME/godot/bin" -type f -name 'Godot_v*' | head -n 1)"
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+
+          curl -L --fail --retry 3 "$BASE/Godot_v${V}-stable_export_templates.tpz" -o "$HOME/godot/templates.tpz"
+          unzip -q "$HOME/godot/templates.tpz" -d "$HOME/godot/templates"
+          cp -a "$HOME/godot/templates/templates/." "$HOME/.local/share/godot/export_templates/${V}.stable/"
+          ls "$HOME/.local/share/godot/export_templates/${V}.stable/" | head -n 20
+
+      - name: Buat debug keystore dan setting editor Godot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android" "$HOME/.config/godot"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" -noprompt
+
+          {
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/.android/debug.keystore"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+
+          for f in editor_settings-4.tres editor_settings-4.4.tres; do
+            {
+              echo '[gd_resource type="EditorSettings" format=3]'
+              echo ''
+              echo '[resource]'
+              echo "export/android/android_sdk_path = \"${ANDROID_HOME}\""
+              echo "export/android/java_sdk_path = \"${JAVA_HOME}\""
+              echo "export/android/debug_keystore = \"$HOME/.android/debug.keystore\""
+              echo 'export/android/debug_keystore_user = "androiddebugkey"'
+              echo 'export/android/debug_keystore_pass = "android"'
+            } > "$HOME/.config/godot/$f"
+          done
+          cat "$HOME/.config/godot/editor_settings-4.4.tres"
+
+      - name: Import resource proyek
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          "$GODOT_BIN" --headless --path "$PROJECT_DIR" --import 2>&1 | tee "$GITHUB_WORKSPACE/build/import.log" || true
+          "$GODOT_BIN" --headless --path "$PROJECT_DIR" --import 2>&1 | tee -a "$GITHUB_WORKSPACE/build/import.log" || true
+
+      - name: Cek error script GDScript
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          "$GODOT_BIN" --headless --path "$PROJECT_DIR" --check-only --script res://scripts/main.gd 2>&1 | tee "$GITHUB_WORKSPACE/build/script-check.log"
+
+      - name: Export debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          "$GODOT_BIN" --headless --path "$PROJECT_DIR" \
+            --export-debug "$PRESET_NAME" "$GITHUB_WORKSPACE/build/$APK_NAME" 2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
+          ls -la "$GITHUB_WORKSPACE/build"
+          test -s "$GITHUB_WORKSPACE/build/$APK_NAME"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZooTycoon-Android-APK
+          path: build/ZooTycoon.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload log build (selalu)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
