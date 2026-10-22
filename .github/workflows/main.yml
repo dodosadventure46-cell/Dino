@@ -80,19 +80,39 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install komponen Android SDK
+      - name: Siapkan Android SDK (bawaan runner GitHub)
         shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install \
-            "cmdline-tools;latest" \
-            "platform-tools" \
-            "platforms;android-34" "platforms;android-35" \
-            "build-tools;34.0.0" "build-tools;35.0.1" \
-            "cmake;3.10.2.4988404" || true
+          set -uo pipefail
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          [ -d "$ANDROID_HOME" ] || ANDROID_HOME="/usr/local/lib/android/sdk"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "SDK di: $ANDROID_HOME"
+          ls "$ANDROID_HOME" || true
+
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+          echo "sdkmanager: ${SDKM:-tidak ada}"
+
+          MISSING=()
+          for item in "platform-tools|platform-tools" \
+                      "platforms;android-34|platforms/android-34" \
+                      "platforms;android-35|platforms/android-35" \
+                      "build-tools;34.0.0|build-tools/34.0.0" \
+                      "build-tools;35.0.1|build-tools/35.0.1"; do
+            pkg="${item%%|*}"; dir="${item##*|}"
+            [ -d "$ANDROID_HOME/$dir" ] || MISSING+=("$pkg")
+          done
+          [ -d "$ANDROID_HOME/cmdline-tools/latest" ] || MISSING+=("cmdline-tools;latest")
+
+          if [ -n "$SDKM" ]; then
+            yes | sudo env "JAVA_HOME=$JAVA_HOME" "PATH=$PATH" "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+            if [ "${#MISSING[@]}" -gt 0 ]; then
+              echo "Memasang komponen yang belum ada: ${MISSING[*]}"
+              yes | sudo env "JAVA_HOME=$JAVA_HOME" "PATH=$PATH" "$SDKM" --sdk_root="$ANDROID_HOME" "${MISSING[@]}" || true
+            fi
+          fi
+          ls "$ANDROID_HOME/build-tools" "$ANDROID_HOME/platforms" "$ANDROID_HOME/cmdline-tools" || true
 
       - name: Download Godot dan export templates
         shell: bash
